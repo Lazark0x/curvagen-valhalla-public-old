@@ -90,6 +90,30 @@ Latency ledger + why 0.2: ADR-0039. Selection-time alternative falsified: ADR-00
 
 It only reorders a bank, so it costs no search and no fills. A K = 3 request builds three loops and the tier only orders them.
 
+### Curvature metric stamp
+
+Stock Valhalla and this fork both store `DirectedEdge::curvature` as 0-15, higher curvier, on different scales, so tiles from stock tools serve silently on the wrong scale. Every tile this fork builds carries `kCurvatureMetricVersion` (`valhalla/baldr/graphconstants.h`) in the header word that was `spareword0_`; tile layout is unchanged. A tile rewritten by a later stage keeps the stamp it came with. Bump the version with any change to `compute_curvature`'s buckets.
+
+`GET /status` reports both sides, always, with no dependence on `service_limits.status.allow_verbose`:
+
+```json
+"engine_curvature_metric": "1", "tileset_curvature_metric": "unknown"
+```
+
+`tileset_curvature_metric` is `unknown` for tiles with no stamp (stock tools, or this fork before the stamp) and when no tile could be read. The engine never refuses to serve on it: unstamped tiles route exactly as before. The value comes from one tile, read once per worker.
+
+**The deploy check** (consumer: curvagen-meta's box script, curvagen-orchestrator's engine gate), after the engine answers, on the exact tileset about to serve:
+
+```sh
+curl -sf localhost:8002/status | jq -e '.engine_curvature_metric != null and .tileset_curvature_metric == .engine_curvature_metric'
+```
+
+Non-zero exit fails the deploy. The `!= null` matters: against a stock engine image both fields are absent and `null == null` is true. `unknown` fails it on purpose, so tiles built before the stamp fail until rebuilt or until an operator waives the check for that tileset. It proves one sampled tile: a directory assembled from two builds needs a rebuild, not a pass.
+
+### Engine build id
+
+`/status`'s `version` is `<valhalla version>-<git sha>` on images from `build-amd64`, the same sha as the `:amd64-<sha>` tag. An image built without the `VERSION_MODIFIER` build arg reports the bare version. Tile headers truncate this string to 15 characters; only `/status` carries the full id.
+
 ## FINGERPRINT rule
 
 **Any change in this fork that alters route output** (geometry, candidate selection, scoring, gates, knob defaults) **requires a `FINGERPRINT_VERSION` bump in curvagen-orchestrator** (`crates/cache` keying) — otherwise stale cached banks serve old-engine routes. The same rule is documented consumer-side in `engine-client`. Coordinate via a cross-linked issue pair (driving repo ↔ consumer repo).
@@ -98,6 +122,7 @@ It only reorders a bank, so it costs no search and no fills. A K = 3 request bui
 
 - 2026-07-16 — document created at the repo split (curvagen-ios ADR-0042). Surface as shipped: v3 round-trip live since 2026-07-14, xcand at strength 0.2 since 2026-07-16, `prefer_curvature` = field 101 on Valhalla 3.8.2 base.
 - 2026-09-07 — **round-trip v4** (valhalla ADR-0042, judged by ADR-0041's Gate v2): loop construction changes, the request shape does not, the response gains the additive per-candidate `provenance`, and the measured configuration moves into `worker.cc` defaults. **v4 alters route output, so the FINGERPRINT rule fires: `FINGERPRINT_VERSION` 4 → 5** in curvagen-orchestrator, in the same commit as the cutover deploy (wayfinder curvagen-valhalla#18). Rollback target is the previous immutable image tag `ghcr.io/lazark0x/valhalla-curvature:amd64-<sha>` plus the previous orchestrator — v4 keys and v3 keys coexist inside the 30 d cache TTL.
+- 2026-10-31 — **curvature metric stamp**: `kCurvatureMetricVersion` 1 written to every new tile header, `engine_curvature_metric` and `tileset_curvature_metric` added to `/status` on every call, `version` gains the git sha on `build-amd64` images. Additive; no tile layout change, no route output change, so no `FINGERPRINT_VERSION` bump. Existing tiles read `unknown` until rebuilt.
 - 2026-11-04 — **`roundtrip.exclude_turnarounds` + `exclude_radius_m`** (curvagen-valhalla#28): optional, additive request fields; served turnarounds are dropped before selection, each sector then takes the best of its top 32 (deep pick), and a short excluded run is topped up from a plain run, so fills never drop below today's. Gate v2's T1 for these Shuffles is read against the engine's own best-16 distinct loops (ADR-0041, amendment 2026-11-04). **The FINGERPRINT rule does not fire:** a request without the field is byte-identical to `5b29936f0`, and the orchestrator never caches an excluded answer (no Memo for Shuffles, no Negative Cache, no Bank Fill). Consumer: curvagen-orchestrator's Shuffle memory, which replaces its interim distance rotation (curvagen-orchestrator#67). Deploy the engine first: an orchestrator that sends the field to an older engine is harmless (ignored) but loses the rotation's partial relief until the engine lands.
 - 2026-11-04 — **fork proto fields move to a private range** (old number + 1000, table above) ahead of the 3.9.1 rebase. JSON keys are unchanged, so JSON output is byte-identical (verified on the rig against `a3ea836af`). **The FINGERPRINT rule does not fire.** A `format=pbf` client built against the old numbers would no longer see these fields; there is none.
 - 2026-11-04 — **engine rebased onto upstream Valhalla 3.9.1** (from 3.8.2; plan in `docs/curvagen/research/2026-11-04-upstream-since-fork.md` on `research/upstream-since-fork`). The surface above is unchanged. Output on the rig tiles, measured against `a3ea836af`: 165/165 byte-identical on the endpoint corpus (round trip K=3/K=12/excluded, one-way + alternates, OSRM navigate, `trace_route`, `/height`), 432/432 Shuffle serves identical, and on loopqual corpus-v2 15 of 552 K=12 answers differ (28 of 6 624 loops, 0.4 %; c0.5 at two urban origins only), where a candidate's pair-pass return no longer builds. Gate v2 meters are equal to the decimal. **The FINGERPRINT rule fires on any output change: `FINGERPRINT_VERSION` 5 → 6** in curvagen-orchestrator, in the same cutover as the engine. Tiles are unchanged (layout-compatible; the engine reads the 3.8.2-built tileset).
