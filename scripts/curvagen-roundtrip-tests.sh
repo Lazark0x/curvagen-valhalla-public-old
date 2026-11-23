@@ -21,7 +21,7 @@ BUILD_DIR="${BUILD_DIR:-build-roundtrip-tests}"
 JOBS="${JOBS:-3}"
 UNIT=(roundtrip_gates roundtrip_score curvature_metric)
 GURKA=(gurka_motorcycle_roundtrip gurka_roundtrip_audit gurka_roundtrip_distinctness
-  gurka_roundtrip_request_faults gurka_loops gurka_motorcycle_curvature
+  gurka_roundtrip_request_faults gurka_roundtrip_exclude gurka_loops gurka_motorcycle_curvature
   gurka_curvature_metric_stamp)
 
 if [ -z "${DEPS_IMAGE:-}" ]; then
