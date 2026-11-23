@@ -104,6 +104,8 @@ protected:
            | |
            | |
            | |
+           | |
+           | |
            E-D
     )";
     const gurka::ways ways = {
@@ -121,7 +123,7 @@ gurka::map RoundTripFaultUncorrelatedReturn::map = {};
 
 TEST_F(RoundTripFaultUncorrelatedReturn, TheLoopThatCannotBuildLeavesTheBankServed) {
   const auto result =
-      gurka::do_action(Options::route, map, rt_request(map, "x", "16000", 3, R"(,"heading":90)"));
+      gurka::do_action(Options::route, map, rt_request(map, "x", "21000", 3, R"(,"heading":90)"));
   ASSERT_EQ(result.trip().routes_size(), 1)
       << "of the three loops banked, the two home through B cannot build";
   const auto paths = gurka::detail::get_paths(result);

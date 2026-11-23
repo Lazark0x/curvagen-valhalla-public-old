@@ -196,7 +196,8 @@ double leg_curviness(baldr::GraphReader& reader, const valhalla::Api& api, int r
 // G1 (F01) — ring-reversal harvest chains.
 //
 //   A-----B-C-DE          AB 6 km, BC 2 km, CD 2 km, ring D-E-F-D ~3.4 km,
-//             F           fresh return road B-G-A.
+//             F           fresh return road B-G-A, far enough south that the clean loop
+//                         A-B-G-A (19.4 km) is a length the 34 km ask may be served.
 //      G
 //
 // The ONLY way the harvest can label the homeward directed edges C->B and B->A is to
@@ -214,6 +215,9 @@ protected:
     const std::string ascii_map = R"(
       A-----B-C-DE
                  F
+
+
+
 
          G
     )";
@@ -1201,7 +1205,7 @@ protected:
                              R"("costing_options":{"motorcycle":{"prefer_curvature":%s,)"
                              R"("reuse_penalty":0.8,"curviness_continuity":%s,)"
                              R"("prefer_elevation":0.3,"top_speed":%s}},)"
-                             R"("roundtrip":{"target_distance":24000,"num_candidates":1}})";
+                             R"("roundtrip":{"target_distance":36000,"num_candidates":1}})";
     const auto& a = map.nodes.at("A");
     const auto req = (boost::format(tmpl) % std::to_string(a.lng()) % std::to_string(a.lat()) %
                       std::to_string(a.lng()) % std::to_string(a.lat()) % decoy %
