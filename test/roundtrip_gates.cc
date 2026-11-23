@@ -125,6 +125,16 @@ TEST(RoundTripGates, ALoopDuplicatingTwoStashEntriesIsDropped) {
   EXPECT_EQ(stash_slot({false, 0.9}, stash, 3, {0, 1}), kNoSlot);
 }
 
+TEST(RoundTripGates, A100KmAskServesLoopsFromHalfToOneAndAHalfTimesIt) {
+  EXPECT_FALSE(served_length(1127000.0, 100000.0)); // Katherine's 11x loop
+  EXPECT_TRUE(served_length(140000.0, 100000.0));
+  EXPECT_FALSE(served_length(45000.0, 100000.0));
+  EXPECT_TRUE(served_length(150000.0, 100000.0));
+  EXPECT_FALSE(served_length(150001.0, 100000.0));
+  EXPECT_TRUE(served_length(50000.0, 100000.0));
+  EXPECT_FALSE(served_length(49999.0, 100000.0));
+}
+
 TEST(RoundTripGates, TheRescueStopsAfterFiveBuildsInARowOnHeldLoops) {
   RescueStop stop;
   for (int i = 0; i < 5; ++i) {

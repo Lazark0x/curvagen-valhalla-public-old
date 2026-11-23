@@ -2139,6 +2139,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
             roundtrip::near_copies(loop_keys(a), loop_keys(b), roundtrip_sharing_frac));
   };
 
+  // A loop outside the served length band is refused wherever it is built, so its slot refills.
+  uint32_t length_refused = 0;
+  auto served_len = [&](const Loop& L) {
+    const double total = static_cast<double>(L.fwd.back().path_distance) +
+                         static_cast<double>(L.ret.back().path_distance);
+    if (roundtrip::served_length(total, target))
+      return true;
+    ++length_refused;
+    return false;
+  };
+
   // At most `want` rejects, no two duplicates, none a bank loop's, none a loop a Shuffle refuses;
   // last_stash is for the ledger.
   uint32_t stash_dups = 0, stash_full_drops = 0;
@@ -2151,6 +2162,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     return ranks;
   };
   auto stash_dirty = [&](Loop&& L) {
+    if (!served_len(L)) {
+      last_stash = 'l';
+      return;
+    }
     if (refused_under_exclusion(L)) {
       last_stash = 'e';
       return;
@@ -2633,7 +2648,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   roundtrip::RescueStop rescue_stop;
   auto rescue_note = [&](char outcome) {
     rescue_trace += outcome;
-    rescue_stop.note(std::strchr("xe", outcome)   ? roundtrip::RescueBuild::kNoLoop
+    rescue_stop.note(std::strchr("xle", outcome)  ? roundtrip::RescueBuild::kNoLoop
                      : std::strchr("ni", outcome) ? roundtrip::RescueBuild::kHeldLoop
                                                   : roundtrip::RescueBuild::kNewLoop);
   };
@@ -2748,12 +2763,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
       // Correction failed or was worse: the original loop stands (one shot, no loop).
     }
-
+    if (!served_len(*built)) {
+      if (rescue_pass)
+        rescue_note('l');
+      continue;
+    }
     if (refused_under_exclusion(*built)) {
       if (rescue_pass)
         rescue_note('e');
       continue; // keep looking; a short answer is topped up (roundtrip_excluding)
     }
+
     {
       std::vector<uint64_t> sig;
       sig.reserve(built->fwd.size() + built->ret.size());
@@ -2886,9 +2906,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                   << " dirty=" << dirty_loops.size() << " fwd_recost_fail=" << pair_fwd_recost_fail
                   << " repair_failed=" << pair_repair_failed << " rev_fail_turn=" << rev_fail_turn
                   << " noret=" << rev_fail_access << " gap=" << rev_fail_gap << "\n";
-      // the gate has judged the BUILT loop (a repaired return may be clean); under
-      // exclusions a refused one leaves its slot to the next twin candidate
-      if (built && !refused_under_exclusion(*built))
+      // the gate has judged the BUILT loop (a repaired return may be clean); a loop out of
+      // the length band, or refused under exclusions, leaves its slot to the next candidate
+      if (built && served_len(*built) && !refused_under_exclusion(*built))
         loops.push_back(std::move(*built));
     }
     pair_allow_twin = false;
@@ -2973,7 +2993,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         " stash_dups=" + std::to_string(stash_dups) +
         " stash_full=" + std::to_string(stash_full_drops) +
         " rescue_trace=" + (rescue_trace.empty() ? "-" : rescue_trace) +
-        " underfill=" + underfill_cause);
+        " underfill=" + underfill_cause + " length_refused=" + std::to_string(length_refused));
   LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
            " r2=" + std::to_string(rung_hits[2]) + " none=" + std::to_string(rung_hits[3]));
   if (loops.size() < want && !dirty_loops.empty()) {

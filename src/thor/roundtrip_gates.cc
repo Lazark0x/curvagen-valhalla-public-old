@@ -134,6 +134,12 @@ size_t stash_slot(const StashRank& loop,
   return last != kNoSlot && stash_before(loop, stash[last]) ? last : kNoSlot;
 }
 
+bool served_length(double loop_m, double target_m) {
+  if (!(target_m > 0.0))
+    return true;
+  return loop_m >= kServedLengthMin * target_m && loop_m <= kServedLengthMax * target_m;
+}
+
 void RescueStop::note(RescueBuild build) {
   if (build == RescueBuild::kHeldLoop)
     ++run_;

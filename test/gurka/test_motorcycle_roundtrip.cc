@@ -1,3 +1,4 @@
+#include "exceptions.h"
 #include "gurka.h"
 #include "test.h"
 
@@ -1051,4 +1052,64 @@ TEST_F(MotorcycleRoundTripDeadEndTip, TipTurnaroundSkippedCleanLoopServed) {
   for (const auto& path : paths)
     for (const auto& edge : path)
       EXPECT_NE(edge, "BT") << "a loop was built to the dead-end tip (out-and-back spike)";
+}
+
+// The 14 km rectangle on the shipped configuration: its one loop is served for asks it is
+// half to one and a half times, and refused for asks it is further from.
+class RoundTripServedLength : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A----B
+      |    |
+      C----D
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}},
+        {"BD", {{"highway", "secondary"}}},
+        {"DC", {{"highway", "secondary"}}},
+        {"CA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/roundtrip_served_length");
+  }
+
+  static valhalla::Api ask(const std::string& target_m) {
+    return gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                            {{"/roundtrip/target_distance", target_m},
+                             {"/roundtrip/num_candidates", "3"}});
+  }
+
+  // Each served loop's length over the ask.
+  static std::vector<double> ratios(const valhalla::Api& result, double target_m) {
+    std::vector<double> out;
+    for (const auto& route : result.trip().routes()) {
+      double length_km = 0;
+      for (const auto& leg : route.legs())
+        for (const auto& node : leg.node())
+          if (node.has_edge())
+            length_km += node.edge().length_km();
+      out.push_back(length_km * 1000.0 / target_m);
+    }
+    return out;
+  }
+};
+gurka::map RoundTripServedLength::map = {};
+
+TEST_F(RoundTripServedLength, ALoopPastOneAndAHalfTimesTheAskIsNotServed) {
+  unsigned code = 0;
+  std::vector<double> served;
+  try {
+    served = ratios(ask("6000"), 6000.0);
+  } catch (const valhalla_exception_t& e) { code = e.code; }
+  EXPECT_EQ(code, 442u) << "served " << served.size() << " loop(s), the first at "
+                        << (served.empty() ? 0.0 : served[0]) << "x a 6 km ask";
+}
+
+TEST_F(RoundTripServedLength, AShorterLoopIsServedDownToHalfTheAsk) {
+  const auto served = ratios(ask("20000"), 20000.0);
+  ASSERT_GE(served.size(), 1u) << "the 14 km loop is 0.7x a 20 km ask";
+  for (double r : served)
+    EXPECT_NEAR(r, 0.7, 0.01);
 }

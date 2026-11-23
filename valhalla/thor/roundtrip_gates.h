@@ -86,6 +86,13 @@ size_t stash_slot(const StashRank& loop,
                   size_t cap,
                   const std::vector<size_t>& dups);
 
+// A loop is served only from kServedLengthMin to kServedLengthMax times the asked distance.
+constexpr double kServedLengthMin = 0.5;
+constexpr double kServedLengthMax = 1.5;
+
+// Whether a loop of loop_m metres may be served for an ask of target_m; any length without one.
+bool served_length(double loop_m, double target_m);
+
 // kHeldLoop: identical to, or a near-copy of, a loop the bank holds.
 enum class RescueBuild { kNoLoop, kHeldLoop, kNewLoop };
 
