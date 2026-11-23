@@ -93,6 +93,7 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_parallel_tier(config.get<bool>("thor.roundtrip_parallel_tier", true)),
       roundtrip_twin_radius_m(config.get<double>("thor.roundtrip_twin_radius_m", 30.0)),
       roundtrip_parallel_radius_m(config.get<double>("thor.roundtrip_parallel_radius_m", 80.0)),
+      roundtrip_road_identity_file(config.get<std::string>("thor.roundtrip_road_identity_file", "")),
       roundtrip_simple_chains(config.get<bool>("thor.roundtrip_simple_chains", true)),
       roundtrip_switchback_test(config.get<bool>("thor.roundtrip_switchback_test", true)),
       roundtrip_built_ranking(config.get<bool>("thor.roundtrip_built_ranking", true)),
@@ -127,10 +128,12 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_pair_relax_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_relax_eval_cap", 150)),
       roundtrip_pair_rescue_last(config.get<bool>("thor.roundtrip_pair_rescue_last", true)) {
 
-  // Built once per process at engine start, so no request pays for it.
+  // Built (or mapped from the pack) once per process at engine start, so no request pays
+  // for it.
   if (roundtrip_road_identity)
     RoadTwinIndex::get(*reader, roundtrip_twin_radius_m, roundtrip_parallel_radius_m,
-                       roundtrip_parallel_tier, roundtrip_switchback_test);
+                       roundtrip_parallel_tier, roundtrip_switchback_test,
+                       roundtrip_road_identity_file);
 
   // Select the matrix algorithm based on the conf file (defaults to
   // select_optimal if not present)

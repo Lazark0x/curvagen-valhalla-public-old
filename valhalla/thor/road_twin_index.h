@@ -26,6 +26,14 @@
 // directions of a twin (exactly as route_leg already does for the corridor edge and
 // its opposing edge), which is what makes the anti-parallel ride impossible.
 //
+// Persisted form.  The index depends only on the tiles and the four parameters, so a
+// region pack can carry it: valhalla_build_road_identity writes it next to the pack's
+// tar, and thor.roundtrip_road_identity_file names it.  get() then maps the file
+// read-only instead of scanning every tile; its pages are file-backed and clean, so
+// they do not count against the process footprint.  A file whose format, parameters,
+// build rules or tileset fingerprint differ from what this process would build is
+// refused with a warning and the index is scanned as before.
+//
 // Keys and values are CANONICAL directed-edge ids: the directed edge with
 // DirectedEdge::forward() == true, i.e. the one whose travel direction matches the
 // stored EdgeInfo shape.  Every undirected road segment has exactly one.  Call sites
@@ -36,6 +44,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -70,11 +79,41 @@ public:
 
   // Process-wide, built once per (tile location, radii) triple.  Keyed rather than a
   // plain singleton because gurka builds many tilesets in one process.  Thread-safe.
+  // A non-empty `persisted_path` is tried first (see Load); on refusal the index is
+  // scanned from the tiles.
   static const RoadTwinIndex& get(baldr::GraphReader& reader,
                                   double twin_radius_m,
                                   double parallel_radius_m,
                                   bool build_parallels,
-                                  bool switchback_test);
+                                  bool switchback_test,
+                                  const std::string& persisted_path = "");
+
+  // An index scanned from every tile `reader` holds, outside the process registry.
+  static std::unique_ptr<RoadTwinIndex> Scan(baldr::GraphReader& reader,
+                                             double twin_radius_m,
+                                             double parallel_radius_m,
+                                             bool build_parallels,
+                                             bool switchback_test);
+
+  // Maps a file written by Save.  nullptr, with the reason in `why`, when the file is
+  // missing, malformed, or was built from other tiles, other parameters or other rules.
+  static std::unique_ptr<RoadTwinIndex> Load(const std::string& path,
+                                             baldr::GraphReader& reader,
+                                             double twin_radius_m,
+                                             double parallel_radius_m,
+                                             bool build_parallels,
+                                             bool switchback_test,
+                                             std::string* why = nullptr);
+
+  // Writes this index for the tileset `reader` holds; false on an IO error.
+  bool Save(const std::string& path, baldr::GraphReader& reader) const;
+
+  // Identical twin and parallel maps and prefilter.
+  bool same_contents(const RoadTwinIndex& other) const;
+
+  // A fingerprint of every tile's id, size and data hash: what a persisted index is
+  // checked against before it is used.
+  static uint64_t tileset_fingerprint(baldr::GraphReader& reader);
 
   // The canonical id of a directed edge = min(edge, opposing edge).
   //
@@ -99,7 +138,7 @@ public:
     append(par_keys_, par_off_, par_vals_, canonical, out);
   }
   bool has_twins(uint64_t canonical) const {
-    return lookup(twin_keys_, canonical) != twin_keys_.size();
+    return lookup(twin_keys_, canonical) != twin_keys_.n;
   }
 
   // proto/v4-p1.1: one-probe Bloom prefilter over the twin key set.  A clear bit is a
@@ -108,38 +147,57 @@ public:
   // request) and >98 % of the answers are "no" — a 512 KiB bit array turns those into
   // one cache probe instead of a ~17-step lower_bound over 115 k keys.
   bool maybe_has_twins(uint64_t canonical) const {
-    if (twin_filter_.empty())
+    if (twin_filter_.n == 0)
       return true;
     const uint64_t h = mix(canonical) & kFilterMask;
-    return (twin_filter_[h >> 6] >> (h & 63)) & 1ull;
+    return (twin_filter_.p[h >> 6] >> (h & 63)) & 1ull;
   }
 
   const Stats& stats() const {
     return stats_;
   }
+  // True when the arrays live in a mapped file rather than in this process's heap.
+  bool mapped() const {
+    return mapping_ != nullptr;
+  }
 
 private:
+  // A read-only array: into the vectors below when scanned, into the mapping when loaded.
+  template <typename T> struct View {
+    const T* p = nullptr;
+    size_t n = 0;
+    const T* begin() const {
+      return p;
+    }
+    const T* end() const {
+      return p + n;
+    }
+  };
+  struct Mapping;
+
   RoadTwinIndex() = default;
+  RoadTwinIndex(const RoadTwinIndex&) = delete; // the views point into this object
+  RoadTwinIndex& operator=(const RoadTwinIndex&) = delete;
   void Build(baldr::GraphReader& reader,
              double twin_radius_m,
              double parallel_radius_m,
              bool build_parallels,
              bool switchback_test);
+  void point_views_at_vectors();
 
-  static size_t lookup(const std::vector<uint64_t>& keys, uint64_t k) {
+  static size_t lookup(const View<uint64_t>& keys, uint64_t k) {
     auto it = std::lower_bound(keys.begin(), keys.end(), k);
-    return (it == keys.end() || *it != k) ? keys.size()
-                                          : static_cast<size_t>(it - keys.begin());
+    return (it == keys.end() || *it != k) ? keys.n : static_cast<size_t>(it - keys.begin());
   }
-  static void append(const std::vector<uint64_t>& keys,
-                     const std::vector<uint32_t>& off,
-                     const std::vector<uint64_t>& vals,
+  static void append(const View<uint64_t>& keys,
+                     const View<uint32_t>& off,
+                     const View<uint64_t>& vals,
                      uint64_t k,
                      std::vector<uint64_t>& out) {
     const size_t i = lookup(keys, k);
-    if (i == keys.size())
+    if (i == keys.n)
       return;
-    out.insert(out.end(), vals.begin() + off[i], vals.begin() + off[i + 1]);
+    out.insert(out.end(), vals.p + off.p[i], vals.p + off.p[i + 1]);
   }
 
   static constexpr uint64_t kFilterBits = 1ull << 22; // 4 Mi bits = 512 KiB
@@ -151,13 +209,19 @@ private:
     x *= 0x94d049bb133111ebull;
     return x ^ (x >> 31);
   }
-  std::vector<uint64_t> twin_filter_;
 
   // CSR: sorted keys, [off[i], off[i+1]) into vals.
-  std::vector<uint64_t> twin_keys_, twin_vals_;
-  std::vector<uint32_t> twin_off_;
-  std::vector<uint64_t> par_keys_, par_vals_;
-  std::vector<uint32_t> par_off_;
+  View<uint64_t> twin_filter_, twin_keys_, twin_vals_, par_keys_, par_vals_;
+  View<uint32_t> twin_off_, par_off_;
+
+  // Storage behind the views: the scanned vectors, or the mapped file.
+  std::vector<uint64_t> own_filter_, own_twin_keys_, own_twin_vals_, own_par_keys_, own_par_vals_;
+  std::vector<uint32_t> own_twin_off_, own_par_off_;
+  std::shared_ptr<const Mapping> mapping_;
+
+  double twin_radius_m_ = 0.0;
+  double parallel_radius_m_ = 0.0; // 0 when parallels are not built
+  bool switchback_test_ = false;
   Stats stats_;
 };
 

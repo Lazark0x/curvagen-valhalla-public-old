@@ -22,7 +22,7 @@ JOBS="${JOBS:-3}"
 UNIT=(roundtrip_gates roundtrip_score curvature_metric)
 GURKA=(gurka_motorcycle_roundtrip gurka_roundtrip_audit gurka_roundtrip_distinctness
   gurka_roundtrip_request_faults gurka_roundtrip_exclude gurka_loops gurka_motorcycle_curvature
-  gurka_curvature_metric_stamp)
+  gurka_curvature_metric_stamp gurka_road_identity_persist)
 
 if [ -z "${DEPS_IMAGE:-}" ]; then
   DEPS_IMAGE="curvagen-valhalla-deps:$(git hash-object scripts/install-linux-deps.sh | cut -c1-12)"

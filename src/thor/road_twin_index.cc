@@ -6,9 +6,16 @@
 #include "midgard/logging.h"
 #include "midgard/pointll.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <chrono>
-#include <functional>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -98,24 +105,287 @@ std::mutex& registry_mutex() {
   return m;
 }
 
+// ---- persisted form ----------------------------------------------------------------
+// One header, then the arrays back to back in this order, each exactly its length:
+//   twin_keys u64, twin_vals u64, par_keys u64, par_vals u64, filter u64,
+//   twin_off u32 (twin_keys + 1), par_off u32 (par_keys + 1).
+// Every u64 array starts 8-aligned because the header is 8-aligned and the u32 arrays
+// come last.  Host byte order; `endian` refuses a file from the other order.
+constexpr char kMagic[8] = {'C', 'V', 'G', 'R', 'T', 'W', 'I', 'N'};
+constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kEndianProbe = 0x01020304u;
+constexpr uint32_t kFlagParallels = 1u;
+constexpr uint32_t kFlagSwitchback = 2u;
+// Bump when Build's logic changes in a way the constants below do not show.
+constexpr uint64_t kBuildRulesVersion = 1;
+
+struct FileHeader {
+  char magic[8];
+  uint32_t format;
+  uint32_t endian;
+  uint64_t rules;   // build_rules_fingerprint()
+  uint64_t tileset; // RoadTwinIndex::tileset_fingerprint()
+  uint64_t tiles;
+  double twin_radius_m;
+  double parallel_radius_m; // 0 when parallels are not built
+  uint32_t flags;
+  uint32_t reserved;
+  uint64_t twin_keys, twin_vals, par_keys, par_vals, filter_words;
+};
+static_assert(sizeof(FileHeader) % 8 == 0, "u64 arrays follow the header");
+
+inline uint64_t mix64(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ull;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+inline uint64_t fold(uint64_t h, uint64_t v) {
+  return mix64(h ^ mix64(v + 0x9e3779b97f4a7c15ull));
+}
+inline uint64_t bits_of(double d) {
+  uint64_t u;
+  std::memcpy(&u, &d, sizeof u);
+  return u;
+}
+
+// Every rule constant Build reads, so a persisted index from other rules is refused.
+uint64_t build_rules_fingerprint(uint64_t filter_bits) {
+  uint64_t h = fold(0, kBuildRulesVersion);
+  for (double d : {kSampleSpacingM, kCoverFraction, kSpanFraction, kBearingTolDeg, kOffsetSpreadM,
+                   kOffsetConstFrac, kCellM, kGridCosLat})
+    h = fold(h, bits_of(d));
+  h = fold(h, kMaxSamplesPerEdge);
+  return fold(h, filter_bits);
+}
+
+uint32_t flags_of(bool build_parallels, bool switchback_test) {
+  return (build_parallels ? kFlagParallels : 0u) | (switchback_test ? kFlagSwitchback : 0u);
+}
+
+uint64_t payload_bytes(const FileHeader& h) {
+  return 8 * (h.twin_keys + h.twin_vals + h.par_keys + h.par_vals + h.filter_words) +
+         4 * (h.twin_keys + 1 + h.par_keys + 1);
+}
+
 } // namespace
+
+struct RoadTwinIndex::Mapping {
+  void* addr = nullptr;
+  size_t len = 0;
+  ~Mapping() {
+    if (addr)
+      munmap(addr, len);
+  }
+};
+
+void RoadTwinIndex::point_views_at_vectors() {
+  twin_filter_ = {own_filter_.data(), own_filter_.size()};
+  twin_keys_ = {own_twin_keys_.data(), own_twin_keys_.size()};
+  twin_vals_ = {own_twin_vals_.data(), own_twin_vals_.size()};
+  twin_off_ = {own_twin_off_.data(), own_twin_off_.size()};
+  par_keys_ = {own_par_keys_.data(), own_par_keys_.size()};
+  par_vals_ = {own_par_vals_.data(), own_par_vals_.size()};
+  par_off_ = {own_par_off_.data(), own_par_off_.size()};
+}
+
+uint64_t RoadTwinIndex::tileset_fingerprint(GraphReader& reader) {
+  const auto set = reader.GetTileSet();
+  std::vector<GraphId> ids(set.begin(), set.end());
+  std::sort(ids.begin(), ids.end(),
+            [](const GraphId& a, const GraphId& b) { return a.value < b.value; });
+  uint64_t h = fold(0, ids.size());
+  for (const auto& id : ids) {
+    h = fold(h, id.value);
+    graph_tile_ptr tile = reader.GetGraphTile(id);
+    if (!tile)
+      continue;
+    h = fold(h, tile->header()->tile_checksum());
+    h = fold(h, tile->header()->dataset_id());
+    h = fold(h, tile->header()->end_offset());
+  }
+  return h;
+}
+
+std::unique_ptr<RoadTwinIndex> RoadTwinIndex::Scan(GraphReader& reader,
+                                                   double twin_radius_m,
+                                                   double parallel_radius_m,
+                                                   bool build_parallels,
+                                                   bool switchback_test) {
+  auto idx = std::unique_ptr<RoadTwinIndex>(new RoadTwinIndex());
+  idx->Build(reader, twin_radius_m, parallel_radius_m, build_parallels, switchback_test);
+  return idx;
+}
+
+bool RoadTwinIndex::Save(const std::string& path, GraphReader& reader) const {
+  FileHeader h{};
+  std::memcpy(h.magic, kMagic, sizeof kMagic);
+  h.format = kFormatVersion;
+  h.endian = kEndianProbe;
+  h.rules = build_rules_fingerprint(kFilterBits);
+  h.tileset = tileset_fingerprint(reader);
+  h.tiles = reader.GetTileSet().size();
+  h.twin_radius_m = twin_radius_m_;
+  h.parallel_radius_m = parallel_radius_m_;
+  h.flags = flags_of(parallel_radius_m_ > 0.0, switchback_test_);
+  h.twin_keys = twin_keys_.n;
+  h.twin_vals = twin_vals_.n;
+  h.par_keys = par_keys_.n;
+  h.par_vals = par_vals_.n;
+  h.filter_words = twin_filter_.n;
+
+  // Written beside the target and renamed over it, so a reader never maps half a file.
+  const std::string tmp = path + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (!f)
+    return false;
+  bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
+  auto put = [&](const auto& v) {
+    if (ok && v.n)
+      ok = std::fwrite(v.p, sizeof(*v.p), v.n, f) == v.n;
+  };
+  put(twin_keys_);
+  put(twin_vals_);
+  put(par_keys_);
+  put(par_vals_);
+  put(twin_filter_);
+  put(twin_off_);
+  put(par_off_);
+  ok = (std::fclose(f) == 0) && ok;
+  if (ok)
+    ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+  if (!ok)
+    std::remove(tmp.c_str());
+  return ok;
+}
+
+std::unique_ptr<RoadTwinIndex> RoadTwinIndex::Load(const std::string& path,
+                                                   GraphReader& reader,
+                                                   double twin_radius_m,
+                                                   double parallel_radius_m,
+                                                   bool build_parallels,
+                                                   bool switchback_test,
+                                                   std::string* why) {
+  auto refuse = [&](const std::string& reason) {
+    if (why)
+      *why = reason;
+    return std::unique_ptr<RoadTwinIndex>();
+  };
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    return refuse("cannot open " + path);
+  struct stat st{};
+  if (::fstat(fd, &st) != 0 || static_cast<uint64_t>(st.st_size) < sizeof(FileHeader)) {
+    ::close(fd);
+    return refuse("shorter than its header");
+  }
+  auto map = std::make_shared<Mapping>();
+  map->len = static_cast<size_t>(st.st_size);
+  void* addr = ::mmap(nullptr, map->len, PROT_READ, MAP_PRIVATE, fd, 0);
+  ::close(fd);
+  if (addr == MAP_FAILED)
+    return refuse("mmap failed");
+  map->addr = addr;
+
+  FileHeader h;
+  std::memcpy(&h, addr, sizeof h);
+  if (std::memcmp(h.magic, kMagic, sizeof kMagic) != 0)
+    return refuse("not a road identity file");
+  if (h.endian != kEndianProbe)
+    return refuse("other byte order");
+  if (h.format != kFormatVersion)
+    return refuse("format " + std::to_string(h.format) + ", this engine reads " +
+                  std::to_string(kFormatVersion));
+  if (h.rules != build_rules_fingerprint(kFilterBits))
+    return refuse("built under other build rules");
+  const double par = build_parallels ? parallel_radius_m : 0.0;
+  if (h.twin_radius_m != twin_radius_m || h.parallel_radius_m != par ||
+      h.flags != flags_of(build_parallels, switchback_test))
+    return refuse("built with other radii or switchback setting");
+  if (h.filter_words != kFilterBits / 64)
+    return refuse("prefilter of the wrong size");
+  if (sizeof h + payload_bytes(h) != map->len)
+    return refuse("size does not match its header");
+  if (h.tiles != reader.GetTileSet().size() || h.tileset != tileset_fingerprint(reader))
+    return refuse("built from other tiles");
+
+  auto idx = std::unique_ptr<RoadTwinIndex>(new RoadTwinIndex());
+  const char* p = static_cast<const char*>(addr) + sizeof h;
+  auto take64 = [&](View<uint64_t>& v, uint64_t n) {
+    v = {reinterpret_cast<const uint64_t*>(p), static_cast<size_t>(n)};
+    p += 8 * n;
+  };
+  auto take32 = [&](View<uint32_t>& v, uint64_t n) {
+    v = {reinterpret_cast<const uint32_t*>(p), static_cast<size_t>(n)};
+    p += 4 * n;
+  };
+  take64(idx->twin_keys_, h.twin_keys);
+  take64(idx->twin_vals_, h.twin_vals);
+  take64(idx->par_keys_, h.par_keys);
+  take64(idx->par_vals_, h.par_vals);
+  take64(idx->twin_filter_, h.filter_words);
+  take32(idx->twin_off_, h.twin_keys + 1);
+  take32(idx->par_off_, h.par_keys + 1);
+  if (idx->twin_off_.p[h.twin_keys] != h.twin_vals || idx->par_off_.p[h.par_keys] != h.par_vals)
+    return refuse("offsets do not end at their values");
+  idx->mapping_ = std::move(map);
+  idx->twin_radius_m_ = h.twin_radius_m;
+  idx->parallel_radius_m_ = h.parallel_radius_m;
+  idx->switchback_test_ = switchback_test;
+  idx->stats_.tiles = h.tiles;
+  idx->stats_.twin_keys = h.twin_keys;
+  idx->stats_.parallel_keys = h.par_keys;
+  idx->stats_.twin_radius_m = h.twin_radius_m;
+  idx->stats_.parallel_radius_m = h.parallel_radius_m;
+  return idx;
+}
+
+bool RoadTwinIndex::same_contents(const RoadTwinIndex& o) const {
+  auto eq = [](const auto& a, const auto& b) {
+    return a.n == b.n && std::equal(a.begin(), a.end(), b.begin());
+  };
+  return eq(twin_filter_, o.twin_filter_) && eq(twin_keys_, o.twin_keys_) &&
+         eq(twin_vals_, o.twin_vals_) && eq(twin_off_, o.twin_off_) && eq(par_keys_, o.par_keys_) &&
+         eq(par_vals_, o.par_vals_) && eq(par_off_, o.par_off_);
+}
 
 const RoadTwinIndex& RoadTwinIndex::get(GraphReader& reader,
                                         double twin_radius_m,
                                         double parallel_radius_m,
                                         bool build_parallels,
-                                        bool switchback_test) {
-  // Keyed by tileset location + radii: gurka builds many tilesets in one process.
+                                        bool switchback_test,
+                                        const std::string& persisted_path) {
+  // Keyed by tileset location + radii + file: gurka builds many tilesets in one process.
   static std::map<std::string, std::unique_ptr<RoadTwinIndex>> registry;
-  const std::string key = reader.GetTileSetLocation() + "|" + std::to_string(twin_radius_m) +
-                          "|" + std::to_string(build_parallels ? parallel_radius_m : 0.0) + "|" +
-                          (switchback_test ? "sb" : "nosb");
+  const std::string key = reader.GetTileSetLocation() + "|" + std::to_string(twin_radius_m) + "|" +
+                          std::to_string(build_parallels ? parallel_radius_m : 0.0) + "|" +
+                          (switchback_test ? "sb" : "nosb") + "|" + persisted_path;
   std::lock_guard<std::mutex> lock(registry_mutex());
   auto it = registry.find(key);
   if (it != registry.end())
     return *it->second;
-  auto idx = std::unique_ptr<RoadTwinIndex>(new RoadTwinIndex());
-  idx->Build(reader, twin_radius_m, parallel_radius_m, build_parallels, switchback_test);
+  std::unique_ptr<RoadTwinIndex> idx;
+  if (!persisted_path.empty()) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string why;
+    idx = Load(persisted_path, reader, twin_radius_m, parallel_radius_m, build_parallels,
+               switchback_test, &why);
+    if (idx) {
+      idx->stats_.build_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      LOG_INFO("roundtrip road identity sidecar: mapped " + persisted_path + " in " +
+               std::to_string(static_cast<int>(idx->stats_.build_ms)) + " ms — " +
+               std::to_string(idx->stats_.tiles) + " tiles, twins " +
+               std::to_string(idx->stats_.twin_keys) + " keyed segments, parallels " +
+               std::to_string(idx->stats_.parallel_keys) + " keyed segments");
+    } else {
+      LOG_WARN("roundtrip road identity sidecar: " + persisted_path + " refused (" + why +
+               "); scanning the tiles instead");
+    }
+  }
+  if (!idx)
+    idx = Scan(reader, twin_radius_m, parallel_radius_m, build_parallels, switchback_test);
   auto* raw = idx.get();
   registry.emplace(key, std::move(idx));
   return *raw;
@@ -127,6 +397,9 @@ void RoadTwinIndex::Build(GraphReader& reader,
                           bool build_parallels,
                           bool switchback_test) {
   const auto t0 = std::chrono::steady_clock::now();
+  twin_radius_m_ = twin_radius_m;
+  parallel_radius_m_ = build_parallels ? parallel_radius_m : 0.0;
+  switchback_test_ = switchback_test;
   stats_.twin_radius_m = twin_radius_m;
   stats_.parallel_radius_m = build_parallels ? parallel_radius_m : 0.0;
   const double max_radius = build_parallels ? std::max(twin_radius_m, parallel_radius_m)
@@ -417,18 +690,19 @@ void RoadTwinIndex::Build(GraphReader& reader,
     }
     off.push_back(static_cast<uint32_t>(vals.size()));
   };
-  emit(twin_pairs, twin_keys_, twin_off_, twin_vals_);
-  emit(par_pairs, par_keys_, par_off_, par_vals_);
+  emit(twin_pairs, own_twin_keys_, own_twin_off_, own_twin_vals_);
+  emit(par_pairs, own_par_keys_, own_par_off_, own_par_vals_);
   // proto/v4-p1.1: the Bloom prefilter over the twin key set (see the header).
-  twin_filter_.assign(kFilterBits / 64, 0ull);
-  for (uint64_t k : twin_keys_) {
+  own_filter_.assign(kFilterBits / 64, 0ull);
+  for (uint64_t k : own_twin_keys_) {
     const uint64_t h = mix(k) & kFilterMask;
-    twin_filter_[h >> 6] |= 1ull << (h & 63);
+    own_filter_[h >> 6] |= 1ull << (h & 63);
   }
-  stats_.twin_keys = twin_keys_.size();
-  stats_.parallel_keys = par_keys_.size();
-  stats_.retained_bytes = twin_keys_.size() * 8 + twin_off_.size() * 4 + twin_vals_.size() * 8 +
-                          par_keys_.size() * 8 + par_off_.size() * 4 + par_vals_.size() * 8;
+  point_views_at_vectors();
+  stats_.twin_keys = twin_keys_.n;
+  stats_.parallel_keys = par_keys_.n;
+  stats_.retained_bytes = twin_keys_.n * 8 + twin_off_.n * 4 + twin_vals_.n * 8 + par_keys_.n * 8 +
+                          par_off_.n * 4 + par_vals_.n * 8;
   stats_.build_ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 

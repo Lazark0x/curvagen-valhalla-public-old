@@ -1226,11 +1226,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // proto/v4-p1: the road-identity sidecar (built at engine start; this is a cached
   // lookup).  `twin_index == nullptr` restores exact v3 behaviour.
   const RoadTwinIndex* twin_index =
-      roundtrip_road_identity ? &RoadTwinIndex::get(*reader, roundtrip_twin_radius_m,
-                                                    roundtrip_parallel_radius_m,
-                                                    roundtrip_parallel_tier,
-                                                    roundtrip_switchback_test)
-                              : nullptr;
+      roundtrip_road_identity
+          ? &RoadTwinIndex::get(*reader, roundtrip_twin_radius_m, roundtrip_parallel_radius_m,
+                                roundtrip_parallel_tier, roundtrip_switchback_test,
+                                roundtrip_road_identity_file)
+          : nullptr;
   const bool parallel_tier = roundtrip_parallel_tier;
   roundtrip::TwinsFn twins_fn;
   if (twin_index)

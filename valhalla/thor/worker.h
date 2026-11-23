@@ -161,6 +161,8 @@ protected:
   bool roundtrip_parallel_tier;
   double roundtrip_twin_radius_m;
   double roundtrip_parallel_radius_m;
+  // The pack's persisted index (valhalla_build_road_identity); empty = scan the tiles.
+  std::string roundtrip_road_identity_file;
   // Reject harvest chains that revisit an undirected edge or its twin.
   bool roundtrip_simple_chains;
 
